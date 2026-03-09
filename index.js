@@ -7,9 +7,9 @@
  *
  * PERSISTENCE STRATEGY:
  *   Each highlight stores the matched text + ~80 chars of surrounding context
- *   (prefix & suffix). On restore, it first tries to find "prefix+text+suffix"
- *   in the page's full text content, then falls back to just "text" alone.
- *   This tolerates minor page edits while still finding the right occurrence.
+ *   (prefix & suffix). On restore, it first tries to anchor via prefix, then
+ *   falls back to bare text search. \r\n in cross-element selections is handled
+ *   by splitting on newlines and finding parts sequentially in the text map.
  */
 
 (function () {
@@ -50,6 +50,63 @@
   }
   function save(list) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+  }
+
+  /* ─── Text normalisation ─────────────────────────────────── */
+  /**
+   * Normalise line endings and strip leading/trailing whitespace per line.
+   * selection.toString() returns \r\n between block elements on Windows,
+   * but text nodes in the DOM are concatenated with no separator at all.
+   * We store/search a \n-normalised form and match parts sequentially.
+   */
+  function normalizeText(s) {
+    return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  }
+
+  /* ─── Smart text finder ──────────────────────────────────── */
+  /**
+   * Find `needle` inside `fullText`, tolerating the absence of \n between
+   * text-node boundaries (the gap where block elements meet).
+   *
+   * Algorithm:
+   *  - Split needle on \n into parts (trimming per-line whitespace).
+   *  - Find the first part, then each subsequent part, allowing a short
+   *    gap in fullText for whitespace-only text nodes between elements.
+   *  - Returns {start, end} of the matched range in fullText, or null.
+   *
+   * `searchFrom` lets callers restrict the search to a window of fullText.
+   */
+  function findText(fullText, needle, searchFrom = 0) {
+    const n = normalizeText(needle);
+
+    if (!n.includes('\n')) {
+      const i = fullText.indexOf(n, searchFrom);
+      return i === -1 ? null : { start: i, end: i + n.length };
+    }
+
+    // Multi-line path: split and match parts sequentially.
+    const parts = n.split('\n').map(p => p.trim()).filter(Boolean);
+    if (!parts.length) return null;
+
+    let from = searchFrom;
+    while (from < fullText.length) {
+      const fi = fullText.indexOf(parts[0], from);
+      if (fi === -1) return null;
+
+      let pos = fi + parts[0].length;
+      let ok  = true;
+
+      for (let i = 1; i < parts.length; i++) {
+        const ni = fullText.indexOf(parts[i], pos);
+        // Allow up to 30 chars of gap (whitespace text nodes between blocks).
+        if (ni === -1 || ni - pos > 30) { ok = false; break; }
+        pos = ni + parts[i].length;
+      }
+
+      if (ok) return { start: fi, end: pos };
+      from = fi + 1;
+    }
+    return null;
   }
 
   /* ─── DOM text map ───────────────────────────────────────── */
@@ -111,10 +168,10 @@
       if (before) frag.appendChild(document.createTextNode(before));
 
       const mark = document.createElement('mark');
-      mark.className  = HIGHLIGHT_CLASS;
+      mark.className    = HIGHLIGHT_CLASS;
       mark.dataset.hlId = id;
-      mark.title      = 'Click to remove highlight';
-      mark.textContent = highlighted;
+      mark.title        = 'Click to remove highlight';
+      mark.textContent  = highlighted;
       mark.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -133,21 +190,28 @@
     if (document.querySelector(`[data-hl-id="${id}"]`)) return true;
 
     const { fullText, nodeMap } = buildTextMap();
-
-    // Try with context first (most precise)
-    const contextStr = prefix + text + suffix;
-    let idx = fullText.indexOf(contextStr);
     let textStart, textEnd;
 
-    if (idx !== -1) {
-      textStart = idx + prefix.length;
-      textEnd   = textStart + text.length;
-    } else {
-      // Fallback: bare text search
-      idx = fullText.indexOf(text);
-      if (idx === -1) return false;   // text no longer exists on page
-      textStart = idx;
-      textEnd   = idx + text.length;
+    // Strategy 1: anchor via prefix (most precise, handles duplicates well).
+    if (prefix) {
+      const prefixIdx = fullText.indexOf(prefix);
+      if (prefixIdx !== -1) {
+        const searchFrom = prefixIdx + prefix.length;
+        // text should start very close to searchFrom
+        const result = findText(fullText, text, searchFrom);
+        if (result && result.start - searchFrom <= 10) {
+          textStart = result.start;
+          textEnd   = result.end;
+        }
+      }
+    }
+
+    // Strategy 2: bare text search fallback.
+    if (textStart === undefined) {
+      const result = findText(fullText, text);
+      if (!result) return false;   // text no longer exists on page
+      textStart = result.start;
+      textEnd   = result.end;
     }
 
     applyRange(nodeMap, textStart, textEnd, id);
@@ -170,13 +234,15 @@
   function highlightSelection() {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed) { toast('Select some text first'); return; }
-    const text = sel.toString().trim();
+
+    // Normalise the raw selection string before storing/searching.
+    const text = normalizeText(sel.toString().trim());
     if (text.length < 2) { toast('Selection too short'); return; }
 
     const { fullText } = buildTextMap();
-    const idx = fullText.indexOf(text);
-    const prefix = idx > -1 ? fullText.slice(Math.max(0, idx - CONTEXT_LEN), idx) : '';
-    const suffix = idx > -1 ? fullText.slice(idx + text.length, idx + text.length + CONTEXT_LEN) : '';
+    const match  = findText(fullText, text);
+    const prefix = match ? fullText.slice(Math.max(0, match.start - CONTEXT_LEN), match.start) : '';
+    const suffix = match ? fullText.slice(match.end, match.end + CONTEXT_LEN) : '';
 
     const list = load();
     // Deduplicate
